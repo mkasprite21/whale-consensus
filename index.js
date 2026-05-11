@@ -9,9 +9,8 @@
 // 5. Serves everything as JSON to your dashboard
 //
 // HOW TO RUN:
-//   npm install express node-fetch cors
-//   node server.js
-//   Dashboard will connect to http://localhost:3001
+//   npm install express cors
+//   node index.js
 // ═══════════════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -69,27 +68,32 @@ async function safeFetch(url, options = {}) {
 }
 
 // ─── Polymarket: Get Leaderboard ─────────────────────────────────────
+// Updated May 2026: endpoint moved to /v1/leaderboard with uppercase enum params
 async function getLeaderboard() {
   console.log("[PM] Fetching leaderboard...");
 
-  // Try the official leaderboard endpoint
   const data = await safeFetch(
-    `${POLYMARKET_DATA_API}/leaderboard?period=month&limit=25&orderBy=pnl`
+    `${POLYMARKET_DATA_API}/v1/leaderboard?timePeriod=MONTH&limit=25&orderBy=PNL`
   );
 
   if (data && Array.isArray(data) && data.length > 0) {
     return data.map((w, i) => ({
-      rank: i + 1,
-      name: w.pseudonym || w.name || w.username || `Wallet ${(w.proxyWallet || w.address || "").slice(0, 8)}`,
-      address: w.proxyWallet || w.address || "",
-      pnl: w.pnl || w.cashPnl || 0,
-      volume: w.volume || w.totalVolume || 0,
-      winRate: w.winRate || null,
-      marketsTraded: w.marketsTraded || w.markets || 0,
+      rank: parseInt(w.rank) || (i + 1),
+      name: w.userName || `Wallet ${(w.proxyWallet || "").slice(0, 8)}`,
+      address: w.proxyWallet || "",
+      pnl: w.pnl || 0,
+      volume: w.vol || 0,
+      // Note: winRate & marketsTraded are no longer exposed by the Polymarket API.
+      // Top traders are ranked by monthly PnL — alignment among them = signal.
+      winRate: null,
+      marketsTraded: 0,
+      xUsername: w.xUsername || null,
+      profileImage: w.profileImage || null,
+      verifiedBadge: !!w.verifiedBadge,
     }));
   }
 
-  console.log("[PM] Leaderboard endpoint returned empty, trying profiles...");
+  console.log("[PM] Leaderboard returned empty");
   return null;
 }
 
@@ -208,7 +212,7 @@ function buildConsensusSignals(whalePositions, kalshiMarkets) {
       }
       marketMap[key].whales.push({
         name: whale.name,
-        winRate: whale.winRate,
+        pnl: whale.pnl,
         outcome: pos.outcome,
         size: pos.currentValue || pos.size * pos.currentPrice,
         avgPrice: pos.avgPrice,
@@ -233,20 +237,20 @@ function buildConsensusSignals(whalePositions, kalshiMarkets) {
     for (const [outcome, whales] of Object.entries(outcomeGroups)) {
       if (whales.length < 2) continue; // Need at least 2 whales
 
-      const avgWinRate = whales.reduce((s, w) => s + (w.winRate || 0.5), 0) / whales.length;
       const totalSize = whales.reduce((s, w) => s + (w.size || 0), 0);
       const avgEntry = whales.reduce((s, w) => s + (w.avgPrice || 0), 0) / whales.length;
       const currentPrice = whales[0]?.currentPrice || 0.5;
 
-      // Estimate edge based on whale count, win rate, and position sizes
-      const edge = Math.min(0.25, (whales.length * 0.03) + ((avgWinRate - 0.5) * 0.4));
+      // Edge estimate — driven by whale count (top-PnL traders agreeing = signal)
+      const edge = Math.min(0.25, whales.length * 0.04);
 
-      // Confidence level
+      // Confidence — based on how many top-PnL whales are aligned on this outcome
+      // (Polymarket's API no longer exposes win rate, so alignment is the signal)
       let confidence;
-      if (whales.length >= 5 && avgWinRate >= 0.7) confidence = "VERY HIGH";
-      else if (whales.length >= 3 && avgWinRate >= 0.68) confidence = "HIGH";
-      else if (whales.length >= 2 && avgWinRate >= 0.6) confidence = "MEDIUM";
-      else confidence = "LOW";
+      if (whales.length >= 5) confidence = "VERY HIGH";
+      else if (whales.length >= 4) confidence = "HIGH";
+      else if (whales.length >= 3) confidence = "MEDIUM";
+      else confidence = "LOW"; // 2 whales
 
       // Find Kalshi match
       const kalshiMatch = findKalshiMatch(market.title, kalshiMarkets);
@@ -265,7 +269,6 @@ function buildConsensusSignals(whalePositions, kalshiMarkets) {
           : null,
         whalesAligned: whales.length,
         whaleNames: whales.map((w) => w.name),
-        avgWinRate,
         totalWhaleSize: totalSize,
         avgEntry,
         edge,
@@ -398,7 +401,7 @@ app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
 ║  🐋 WHALE CONSENSUS SERVER                              ║
-║  Running on http://localhost:${PORT}                       ║
+║  Running on port ${PORT}                                  ║
 ║                                                          ║
 ║  Endpoints:                                              ║
 ║    GET  /api/health      — Server status                 ║
