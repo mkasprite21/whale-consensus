@@ -37,6 +37,75 @@ let cache = {
   lastUpdated: 0,
 };
 
+// ─── Sports team dictionary (used by the matcher) ────────────────────
+// Lowercase team names that appear in market titles across MLB, NBA,
+// NFL, NHL, EPL, and major international soccer leagues.
+const SPORTS_TEAMS = [
+  // MLB
+  "yankees", "orioles", "rays", "red sox", "blue jays",
+  "astros", "mariners", "rangers", "athletics", "angels",
+  "twins", "tigers", "white sox", "royals", "guardians",
+  "braves", "mets", "phillies", "marlins", "nationals",
+  "cubs", "brewers", "reds", "pirates", "cardinals",
+  "dodgers", "padres", "giants", "diamondbacks", "rockies",
+  // NBA
+  "lakers", "celtics", "warriors", "bucks", "bulls", "heat",
+  "nets", "knicks", "76ers", "sixers", "raptors", "pacers",
+  "cavaliers", "cavs", "pistons", "hornets", "magic", "hawks",
+  "wizards", "mavericks", "mavs", "rockets", "spurs", "pelicans",
+  "grizzlies", "nuggets", "jazz", "thunder", "timberwolves",
+  "trail blazers", "blazers", "suns", "kings", "clippers",
+  // NFL
+  "chiefs", "bills", "patriots", "dolphins", "jets", "ravens",
+  "bengals", "browns", "steelers", "texans", "colts", "jaguars",
+  "titans", "broncos", "chargers", "raiders", "cowboys", "eagles",
+  "commanders", "bears", "lions", "packers", "vikings", "falcons",
+  "panthers", "saints", "buccaneers", "rams", "49ers", "seahawks",
+  // NHL
+  "bruins", "sabres", "red wings", "canadiens", "senators",
+  "lightning", "maple leafs", "hurricanes", "blue jackets",
+  "devils", "islanders", "flyers", "penguins", "capitals",
+  "blackhawks", "avalanche", "stars", "wild", "predators",
+  "blues", "ducks", "flames", "oilers", "sharks", "kraken",
+  "canucks", "golden knights",
+  // EPL & major European soccer
+  "arsenal", "chelsea", "liverpool", "tottenham", "newcastle",
+  "aston villa", "brighton", "west ham", "crystal palace",
+  "brentford", "fulham", "wolves", "everton", "bournemouth",
+  "nottingham forest", "leicester", "southampton", "burnley",
+  "man city", "manchester city", "man united", "manchester united",
+  "napoli", "juventus", "milan", "inter", "roma", "lazio",
+  "real madrid", "barcelona", "atletico", "psg", "bayern",
+  "dortmund", "leipzig", "ajax", "porto", "benfica",
+  "millwall", "hull city", "leeds", "sunderland",
+  // MLS / international
+  "lafc", "galaxy", "atlanta united", "seattle sounders",
+  "inter miami", "messi"
+];
+
+// Generic sport keywords that signal "this is a sports market"
+const SPORTS_KEYWORDS = [
+  "mlb", "nba", "nfl", "nhl", "mls", "epl", "ncaa", "ufc",
+  "baseball", "basketball", "soccer", "hockey", "moneyline",
+  "playoffs", "championship", "world cup", "champions league"
+];
+
+// Non-sports topical keywords that get a small boost when matched
+const TOPIC_KEYWORDS = [
+  "fed", "rate", "cut", "bitcoin", "btc", "ethereum", "eth",
+  "trump", "election", "gdp", "inflation", "shutdown", "spacex",
+  "starship", "biden", "fomc", "recession", "cpi", "powell",
+  "tariff", "supreme court", "putin", "ukraine", "israel"
+];
+
+// Stop words to ignore when comparing market titles
+const STOP_WORDS = new Set([
+  "will", "the", "be", "have", "does", "before", "after",
+  "above", "below", "what", "when", "where", "vs", "and",
+  "with", "this", "that", "from", "into", "than", "then",
+  "are", "for", "between", "during", "ends", "end"
+]);
+
 // ─── Fetch Helpers ───────────────────────────────────────────────────
 async function safeFetch(url, options = {}) {
   try {
@@ -68,7 +137,6 @@ async function safeFetch(url, options = {}) {
 }
 
 // ─── Polymarket: Get Leaderboard ─────────────────────────────────────
-// Updated May 2026: endpoint moved to /v1/leaderboard with uppercase enum params
 async function getLeaderboard() {
   console.log("[PM] Fetching leaderboard...");
 
@@ -83,8 +151,6 @@ async function getLeaderboard() {
       address: w.proxyWallet || "",
       pnl: w.pnl || 0,
       volume: w.vol || 0,
-      // Note: winRate & marketsTraded are no longer exposed by the Polymarket API.
-      // Top traders are ranked by monthly PnL — alignment among them = signal.
       winRate: null,
       marketsTraded: 0,
       xUsername: w.xUsername || null,
@@ -123,9 +189,10 @@ async function getUserPositions(address) {
 async function getKalshiMarkets() {
   console.log("[KALSHI] Fetching active markets...");
 
-  // Kalshi public endpoint — no auth needed for market data
+  // Pull a larger pool (1000) so sports markets deeper in the listing
+  // don't get missed by the matcher.
   const data = await safeFetch(
-    `${KALSHI_API}/markets?limit=200&status=open`
+    `${KALSHI_API}/markets?limit=1000&status=open`
   );
 
   if (!data || !data.markets) {
@@ -150,42 +217,72 @@ async function getKalshiMarkets() {
 }
 
 // ─── Cross-Reference: Find Kalshi Matches for Poly Markets ───────────
+// Sports-aware matcher:
+//   1. Detects whether the Polymarket title is a sports market by looking
+//      for team names or sport keywords.
+//   2. For sports, heavily weights team-name matches (e.g. "yankees"
+//      appearing in both titles is gold — it's a near-unique identifier).
+//   3. For non-sports, falls back to topical keyword + word overlap.
 function findKalshiMatch(polyTitle, kalshiMarkets) {
   if (!polyTitle || !kalshiMarkets.length) return null;
 
   const normalize = (s) =>
     s.toLowerCase()
-      .replace(/[^a-z0-9\s]/g, "")
+      .replace(/[^a-z0-9\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
   const polyNorm = normalize(polyTitle);
 
-  // Extract key terms from the Polymarket title
+  // Which teams from our dictionary appear in this Polymarket title?
+  const polyTeams = SPORTS_TEAMS.filter((t) => polyNorm.includes(t));
+  const hasSportsKeyword = SPORTS_KEYWORDS.some((k) => polyNorm.includes(k));
+  const isSports = polyTeams.length > 0 || hasSportsKeyword;
+
+  // Generic content words (length > 3, not a stop word)
   const keyTerms = polyNorm
     .split(" ")
-    .filter((w) => w.length > 3 && !["will", "the", "be", "have", "does", "before", "after", "above", "below"].includes(w));
+    .filter((w) => w.length > 3 && !STOP_WORDS.has(w));
 
   let bestMatch = null;
   let bestScore = 0;
 
   for (const km of kalshiMarkets) {
     const kalshiNorm = normalize(km.title || km.question || "");
+    if (!kalshiNorm) continue;
 
-    // Count matching key terms
     let score = 0;
+
+    // Generic word overlap
     for (const term of keyTerms) {
       if (kalshiNorm.includes(term)) score++;
     }
 
-    // Boost for matching important words
-    const importantWords = ["fed", "rate", "cut", "bitcoin", "btc", "ethereum", "eth", "trump", "election", "gdp", "inflation", "shutdown", "spacex", "starship"];
-    for (const w of importantWords) {
+    // Topical keyword boost (politics, crypto, economics, etc.)
+    for (const w of TOPIC_KEYWORDS) {
       if (polyNorm.includes(w) && kalshiNorm.includes(w)) score += 2;
     }
 
-    // Minimum threshold: at least 3 matching terms or 2 important words
-    if (score > bestScore && score >= 3) {
+    // SPORTS BOOST — team-name matching is highly specific
+    if (isSports && polyTeams.length > 0) {
+      const matchingTeams = polyTeams.filter((t) => kalshiNorm.includes(t));
+      if (matchingTeams.length >= 2) {
+        // Both teams from a head-to-head match present = same game
+        score += 8;
+      } else if (matchingTeams.length === 1 && polyTeams.length === 1) {
+        // Single-team poly market and that team is in Kalshi
+        score += 5;
+      } else if (matchingTeams.length === 1) {
+        // Only one of two teams matches — weaker but possible
+        score += 2;
+      }
+    }
+
+    // Threshold: sports markets need 5+ (a strong team-name match alone
+    // is enough), non-sports need 3+ (existing behavior).
+    const threshold = isSports ? 5 : 3;
+
+    if (score > bestScore && score >= threshold) {
       bestScore = score;
       bestMatch = km;
     }
@@ -241,11 +338,10 @@ function buildConsensusSignals(whalePositions, kalshiMarkets) {
       const avgEntry = whales.reduce((s, w) => s + (w.avgPrice || 0), 0) / whales.length;
       const currentPrice = whales[0]?.currentPrice || 0.5;
 
-      // Edge estimate — driven by whale count (top-PnL traders agreeing = signal)
+      // Edge estimate — driven by whale count
       const edge = Math.min(0.25, whales.length * 0.04);
 
-      // Confidence — based on how many top-PnL whales are aligned on this outcome
-      // (Polymarket's API no longer exposes win rate, so alignment is the signal)
+      // Confidence — based on how many top-PnL whales are aligned
       let confidence;
       if (whales.length >= 5) confidence = "VERY HIGH";
       else if (whales.length >= 4) confidence = "HIGH";
@@ -297,7 +393,8 @@ function guessCategoryFromTitle(title) {
   if (/bitcoin|btc|ethereum|eth|crypto|token|defi/.test(t)) return "Crypto";
   if (/trump|biden|election|congress|senate|governor|president|democrat|republican/.test(t)) return "Politics";
   if (/spacex|apple|google|ai |openai|meta |microsoft/.test(t)) return "Tech";
-  if (/nfl|nba|mlb|nhl|game|match|score|championship/.test(t)) return "Sports";
+  if (SPORTS_TEAMS.some((team) => t.includes(team))) return "Sports";
+  if (/nfl|nba|mlb|nhl|game|match|score|championship|playoff|soccer/.test(t)) return "Sports";
   return "Other";
 }
 
@@ -316,11 +413,10 @@ async function refreshData() {
   const leaderboard = await getLeaderboard();
   cache.leaderboard = leaderboard;
 
-  // Step 2: Get positions for top whales
+  // Step 2: Get positions for top whales (expanded from 10 to 15)
   const whalePositions = [];
   if (leaderboard) {
-    // Fetch positions for top 10 whales (rate-limit friendly)
-    const topWhales = leaderboard.slice(0, 10);
+    const topWhales = leaderboard.slice(0, 15);
     for (const whale of topWhales) {
       if (!whale.address) continue;
       console.log(`[PM] Fetching positions for ${whale.name}...`);
