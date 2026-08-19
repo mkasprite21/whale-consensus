@@ -135,7 +135,8 @@ function score(t) {
   s += Math.min(Math.max(t.pnl15d, 0) / 100000, 1) * 10;
 
   // Win-rate sweet spot: confident favorites, not thin-edge farming.
-  if (t.winRate15d !== null) s += (t.winRate15d >= 0.6 && t.winRate15d <= 0.85 ? 1 : 0.4) * 10;
+  // Widened to 0.55-0.88 after the live #1 (Elite, rank 1) came in at 58.9%.
+  if (t.winRate15d !== null) s += (t.winRate15d >= 0.55 && t.winRate15d <= 0.88 ? 1 : 0.4) * 10;
 
   if (t.trajectory === "improving") s += 5;                       // momentum
   if (t.sharpe15d !== null) s += Math.min(Math.max(t.sharpe15d, 0) / 3, 1) * 5;
