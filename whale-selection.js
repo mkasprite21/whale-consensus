@@ -2,45 +2,54 @@
 // whale-selection.js — builds the tracked whale pool for Whale Consensus
 // ═══════════════════════════════════════════════════════════════════════
 // Data source: Falcon API (Polymarket Analytics).
-//   POST https://retriever.falconapi.net/api/v2/semantic/retrieve/parameterized
-//   Auth: Authorization: Bearer <token>
-//   You address datasets by agent_id, not by URL path.
+//   Agent 584 = Falcon Score Leaderboard (trader quality ranking)
+//   Agent 581 = Wallet 360 (60+ metrics, optional deep vetting)
 //
-// Requires Node 18+ (built-in fetch). Render uses 18+ by default.
-// CommonJS. If index.js uses `import`, swap module.exports for `export {}`.
+// Falcon's agent 584 does most of our filtering server-side, so we spend
+// ONE credit per day instead of screening thousands of rows ourselves.
 //
-// ─── THE ONE THING YOU MUST SET ────────────────────────────────────────
-// AGENTS.leaderboard below is a placeholder. Log into the Falcon dashboard,
-// find the agent_id for the "Top Polymarket Traders" / leaderboard dataset,
-// and paste it in. 574 = markets and 586 = single-wallet performance are
-// documented; the leaderboard id is not, so it must come from your account.
-// Until it is set, run `node whale-selection.js --probe` to test connection.
+// CREDIT BUDGET (free plan = 100/day):
+//   Selection runs ONCE PER DAY and is cached. 1 credit/day.
+//   Optional Wallet 360 enrichment costs 1 credit per whale (25 = 25/day).
+//   Never call selectWhalePool() on the 5-minute refresh loop.
+//
+// Requires Node 18+ (built-in fetch). CommonJS.
 
 const CONFIG = {
+  // The quickstart curl and the context file list different hosts.
+  // retriever.falconapi.net is the one our probe confirmed working.
   url: "https://retriever.falconapi.net/api/v2/semantic/retrieve/parameterized",
-  token: process.env.FALCON_API_KEY,   // set in Render > Environment. Never hardcode.
+  fallbackUrl: "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized",
+  token: process.env.FALCON_API_KEY,   // set in Render > Environment
   poolSize: 25,
-  pageLimit: 200,
-  maxPages: 5,                          // safety cap: 1000 traders max
+  cacheHours: 24,                      // refresh the pool once per day
+  enrichWithWallet360: false,          // true = +1 credit per whale
 };
 
 const AGENTS = {
-  leaderboard: null,   // <<< SET THIS from your Falcon dashboard
-  walletPerf: 586,     // documented: single-wallet performance
-  markets: 574,        // documented: markets/outcomes (used later by Layer 2)
+  falconScore: 584,   // trader quality leaderboard  <- our selection source
+  wallet360: 581,     // 60+ metrics for one wallet
+  trades: 556,        // live trade feed (Layer 2 will use this)
+  markets: 574,
 };
 
-// ─── Selection criteria ────────────────────────────────────────────────
-const CRITERIA = {
-  minProfitFactor: 3.0,      // only enforced if gains/losses are exposed
-  profitFactorCap: 20,
-  minTotalTrades: 200,       // big enough sample to be skill, not luck
-  maxTotalTrades: 5000,      // above this it is a bot you cannot mirror by hand
-  minRoiPct: 5,              // must actually be profitable
-  minTotalPnl: 50000,        // plays meaningful size
-  minRecentRoiPct: 0,        // 15d/30d ROI must be green -> the recency filter
-  minWinRate: 0.55,          // soft floor, only if exposed
+// ─── Selection filters (sent to Falcon, applied server-side) ───────────
+// NOTE: every metric here is a 15-DAY window, not all-time. That is what
+// makes this a recency filter by default.
+const FILTERS = {
+  min_win_rate_15d: "0.55",      // real skill floor
+  max_win_rate_15d: "0.92",      // excludes thin-edge favorite-farmers
+  min_roi_15d: "5",              // must be beating flat by a real margin
+  min_pnl_15d: "5000",           // plays meaningful size
+  min_total_trades_15d: "30",    // enough activity to be a sample
+  max_total_trades_15d: "5000",  // not a bot you cannot mirror
+  sort_by: "roi",
 };
+
+// ─── Local cache ───────────────────────────────────────────────────────
+let cache = { pool: null, fetchedAt: 0 };
+const cacheIsFresh = () =>
+  cache.pool && Date.now() - cache.fetchedAt < CONFIG.cacheHours * 3600 * 1000;
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 const num = (v) => {
@@ -53,104 +62,86 @@ const has = (v) => v !== null && v !== undefined && v !== "";
 function normalizeWinRate(v) {
   if (!has(v)) return null;
   const n = num(v);
-  return n > 1 ? n / 100 : n;
+  return n > 1 ? n / 100 : n;   // accept 96.3 or 0.963
 }
 
 // ─── Normalize a Falcon row -> our internal shape ──────────────────────
-// Falcon returns numbers as STRINGS ("-1396944.57"), so everything goes
-// through num(). Fields Falcon may not expose stay null, and any filter
-// depending on them is skipped rather than failing the trader.
+// Falcon returns numbers as STRINGS, so everything goes through num().
+// Fields Falcon may not expose stay null and their logic is skipped.
 // >>> If a field name differs, fix it HERE and nowhere else. <<<
 function normalizeTrader(raw) {
-  const gainsRaw = raw.total_gains ?? raw.gains ?? raw.total_wins;
-  const lossesRaw = raw.total_losses ?? raw.losses;
   return {
-    address: raw.proxy_wallet ?? raw.wallet_address ?? raw.address ?? null,
+    address: raw.proxy_wallet ?? raw.wallet_address ?? raw.wallet ?? raw.address ?? null,
     name: raw.username ?? raw.name ?? raw.proxy_wallet ?? "unknown",
-    totalPnl: num(raw.total_pnl ?? raw.pnl),
-    roiPct: num(raw.roi_pct ?? raw.roi),
-    totalInvested: num(raw.total_invested),
-    totalTrades: num(raw.total_trades ?? raw.trades ?? raw.total_positions),
-    avgTradeSize: num(raw.avg_trade_size),
-    avgPnlPerTrade: num(raw.avg_pnl_per_trade),
-    // Recency: Falcon's leaderboard shows a 15d ROI. Accept several spellings.
-    recentRoiPct: has(raw.roi_15d ?? raw.roi_15d_pct ?? raw.pnl_15d ?? raw.roi_30d)
-      ? num(raw.roi_15d ?? raw.roi_15d_pct ?? raw.pnl_15d ?? raw.roi_30d)
+    winRate15d: normalizeWinRate(raw.win_rate_15d ?? raw.win_rate ?? raw.winRate),
+    roi15d: num(raw.roi_15d ?? raw.roi_pct ?? raw.roi),
+    pnl15d: num(raw.pnl_15d ?? raw.total_pnl ?? raw.pnl),
+    trades15d: num(raw.total_trades_15d ?? raw.total_trades ?? raw.trades),
+    falconScore: has(raw.falcon_score ?? raw.h_score ?? raw.score)
+      ? num(raw.falcon_score ?? raw.h_score ?? raw.score)
       : null,
-    fScore: has(raw.f_score ?? raw.fscore) ? num(raw.f_score ?? raw.fscore) : null,
-    gains: has(gainsRaw) ? Math.abs(num(gainsRaw)) : null,
-    losses: has(lossesRaw) ? Math.abs(num(lossesRaw)) : null,
-    winRate: normalizeWinRate(raw.win_rate ?? raw.winRate ?? raw.win_pct),
     raw,
   };
 }
 
-// Profit factor: null when Falcon does not expose the gains/losses split.
-function profitFactor(t) {
-  if (t.gains === null || t.losses === null) return null;
-  if (t.losses <= 0) return CRITERIA.profitFactorCap;
-  return Math.min(t.gains / t.losses, CRITERIA.profitFactorCap);
-}
-
-// ─── Filter ────────────────────────────────────────────────────────────
+// ─── Local sanity re-check ─────────────────────────────────────────────
+// Falcon already filtered server-side. This only catches rows that slip
+// through (nulls, unexpected shapes) so bad data cannot reach the pool.
 function passesFilters(t) {
   const reasons = [];
-  const pf = profitFactor(t);
-
-  if (pf !== null && pf < CRITERIA.minProfitFactor) reasons.push(`profit factor ${pf.toFixed(2)}`);
-  if (t.totalTrades && t.totalTrades < CRITERIA.minTotalTrades) reasons.push(`only ${t.totalTrades} trades`);
-  if (t.totalTrades && t.totalTrades > CRITERIA.maxTotalTrades) reasons.push(`high-freq ${t.totalTrades}`);
-  if (t.roiPct < CRITERIA.minRoiPct) reasons.push(`roi ${t.roiPct}%`);
-  if (t.totalPnl < CRITERIA.minTotalPnl) reasons.push(`pnl $${Math.round(t.totalPnl)}`);
-  if (t.recentRoiPct !== null && t.recentRoiPct <= CRITERIA.minRecentRoiPct)
-    reasons.push(`recent roi ${t.recentRoiPct}%`);
-  if (t.winRate !== null && t.winRate < CRITERIA.minWinRate)
-    reasons.push(`winrate ${(t.winRate * 100).toFixed(0)}%`);
-
+  if (!t.address) reasons.push("no wallet address");
+  if (t.winRate15d !== null) {
+    if (t.winRate15d < num(FILTERS.min_win_rate_15d)) reasons.push(`winrate ${(t.winRate15d * 100).toFixed(0)}%`);
+    if (t.winRate15d > num(FILTERS.max_win_rate_15d)) reasons.push(`favorite-farmer ${(t.winRate15d * 100).toFixed(0)}%`);
+  }
+  if (t.roi15d && t.roi15d < num(FILTERS.min_roi_15d)) reasons.push(`roi ${t.roi15d}%`);
+  if (t.trades15d && t.trades15d < num(FILTERS.min_total_trades_15d)) reasons.push(`only ${t.trades15d} trades`);
+  if (t.trades15d && t.trades15d > num(FILTERS.max_total_trades_15d)) reasons.push(`high-freq ${t.trades15d}`);
   return { ok: reasons.length === 0, reasons };
 }
 
-// ─── Score ─────────────────────────────────────────────────────────────
-// Weights shift depending on which fields exist. Discipline first when we
-// can measure it (profit factor), otherwise lean on ROI and Falcon F-Score.
+// ─── Score (ranking within the survivors) ──────────────────────────────
+// Falcon Score first when present (it is their bot/luck-filtered ranking),
+// then ROI, then a mild bonus for the 60-85% win-rate sweet spot.
 function score(t) {
   let s = 0;
-  const pf = profitFactor(t);
+  if (t.falconScore !== null) s += Math.min(t.falconScore / 100, 1) * 45;
+  else s += Math.min(Math.max(t.roi15d, 0) / 50, 1) * 45;
 
-  if (pf !== null) s += (pf / CRITERIA.profitFactorCap) * 40;
-  else if (t.fScore !== null) s += Math.min(t.fScore / 100, 1) * 40;
-  else s += Math.min(Math.max(t.roiPct, 0) / 50, 1) * 40;
+  s += Math.min(Math.max(t.roi15d, 0) / 50, 1) * 30;
+  s += Math.min(Math.max(t.pnl15d, 0) / 100000, 1) * 15;
 
-  if (t.recentRoiPct !== null) s += Math.min(Math.max(t.recentRoiPct, 0) / 20, 1) * 30; // recency
-  s += Math.min(Math.max(t.roiPct, 0) / 50, 1) * 20;                                     // overall ROI
-  if (t.winRate !== null) s += t.winRate * 10;
-  else s += Math.min(t.totalTrades / CRITERIA.maxTotalTrades, 1) * 10;                   // sample depth
-
+  if (t.winRate15d !== null) {
+    const sweet = t.winRate15d >= 0.6 && t.winRate15d <= 0.85 ? 1 : 0.5;
+    s += sweet * 10;
+  }
   return s;
 }
 
 // ─── Falcon request ────────────────────────────────────────────────────
-async function falconQuery(agentId, params = {}, limit = CONFIG.pageLimit, offset = 0) {
+async function falconQuery(agentId, params = {}, limit = 100, offset = 0) {
   if (!CONFIG.token) throw new Error("FALCON_API_KEY is not set. Add it in Render > Environment.");
-  if (!agentId) throw new Error("agent_id is not set. Fill AGENTS.leaderboard from your Falcon dashboard.");
 
-  const res = await fetch(CONFIG.url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CONFIG.token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      agent_id: agentId,
-      params,
-      pagination: { limit, offset },
-      formatter_config: { format_type: "raw" },
-    }),
+  const body = JSON.stringify({
+    agent_id: agentId,
+    params,
+    pagination: { limit, offset },      // limit max is 200
+    formatter_config: { format_type: "raw" },
   });
+  const headers = {
+    Authorization: `Bearer ${CONFIG.token}`,
+    "Content-Type": "application/json",
+  };
 
+  let res;
+  try {
+    res = await fetch(CONFIG.url, { method: "POST", headers, body });
+  } catch (e) {
+    res = await fetch(CONFIG.fallbackUrl, { method: "POST", headers, body });
+  }
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Falcon returned ${res.status} ${res.statusText}. ${body.slice(0, 300)}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`Falcon ${res.status} ${res.statusText}. ${text.slice(0, 300)}`);
   }
 
   const json = await res.json();
@@ -160,58 +151,62 @@ async function falconQuery(agentId, params = {}, limit = CONFIG.pageLimit, offse
   };
 }
 
+// ─── Optional deep vetting via Wallet 360 (costs 1 credit per whale) ───
+async function enrichWallet(address) {
+  const { rows } = await falconQuery(
+    AGENTS.wallet360,
+    { proxy_wallet: address, window_days: "15" },   // allowed: 1, 3, 7, 15
+    1, 0
+  );
+  return rows[0] || null;
+}
+
 // ─── Public entry point ────────────────────────────────────────────────
-async function selectWhalePool() {
-  const all = [];
-  for (let page = 0; page < CONFIG.maxPages; page++) {
-    const { rows, hasMore } = await falconQuery(
-      AGENTS.leaderboard, {}, CONFIG.pageLimit, page * CONFIG.pageLimit
-    );
-    all.push(...rows);
-    if (!hasMore || rows.length === 0) break;
+async function selectWhalePool({ force = false } = {}) {
+  if (!force && cacheIsFresh()) {
+    console.log(`[whale-selection] using cached pool (${cache.pool.length} whales)`);
+    return cache.pool;
   }
 
-  const traders = all.map(normalizeTrader);
+  const { rows } = await falconQuery(AGENTS.falconScore, FILTERS, 100, 0);
+  const traders = rows.map(normalizeTrader);
   const passed = traders.filter((t) => passesFilters(t).ok);
   passed.sort((a, b) => score(b) - score(a));
 
   const pool = passed.slice(0, CONFIG.poolSize).map((t) => ({
     name: t.name,
     address: t.address,
-    profitFactor: profitFactor(t),
-    roiPct: t.roiPct,
-    recentRoiPct: t.recentRoiPct,
-    totalTrades: t.totalTrades,
-    totalPnl: t.totalPnl,
+    winRate: t.winRate15d !== null ? +(t.winRate15d * 100).toFixed(1) : null,
+    roi15d: t.roi15d,
+    pnl15d: t.pnl15d,
+    trades15d: t.trades15d,
+    falconScore: t.falconScore,
     score: +score(t).toFixed(1),
   }));
 
+  if (CONFIG.enrichWithWallet360) {
+    for (const w of pool) {
+      try { w.wallet360 = await enrichWallet(w.address); }
+      catch (e) { w.wallet360 = null; }
+    }
+  }
+
+  cache = { pool, fetchedAt: Date.now() };
   console.log(`[whale-selection] fetched ${traders.length}, passed ${passed.length}, keeping ${pool.length}`);
   pool.forEach((t, i) =>
-    console.log(`  ${String(i + 1).padStart(2)}. ${String(t.name).slice(0, 22).padEnd(22)} ROI ${t.roiPct}%  recent ${t.recentRoiPct ?? "n/a"}  trades ${t.totalTrades}  score ${t.score}`)
+    console.log(`  ${String(i + 1).padStart(2)}. ${String(t.name).slice(0, 20).padEnd(20)} win ${t.winRate ?? "n/a"}%  roi ${t.roi15d}%  trades ${t.trades15d}  score ${t.score}`)
   );
   return pool;
 }
 
-// ─── Probe: run `node whale-selection.js --probe` ──────────────────────
-// Confirms the key works and PRINTS ONE RAW ROW so you can see the real
-// field names. Paste that row to me and I will lock normalizeTrader().
+// ─── Probe: GET /api/probe ─────────────────────────────────────────────
 async function probe() {
-  const agentId = AGENTS.leaderboard || AGENTS.walletPerf;
-  console.log(`Probing Falcon with agent_id ${agentId}...`);
-  try {
-    const { rows } = await falconQuery(
-      agentId,
-      AGENTS.leaderboard ? {} : { wallet_address: "0x6ac5bb06a9eb05641fd5e82640268b92f3ab4b6e" },
-      3, 0
-    );
-    console.log(`Connection OK. ${rows.length} row(s) returned.\nFirst raw row:`);
-    console.log(JSON.stringify(rows[0], null, 2));
-  } catch (e) {
-    console.error("Probe failed:", e.message);
-  }
+  const { rows } = await falconQuery(AGENTS.falconScore, FILTERS, 3, 0);
+  return { agentId: AGENTS.falconScore, filters: FILTERS, rowCount: rows.length, firstRow: rows[0] || null };
 }
 
-if (require.main === module && process.argv.includes("--probe")) probe();
-
-module.exports = { selectWhalePool, passesFilters, score, profitFactor, normalizeTrader, falconQuery, CRITERIA, CONFIG, AGENTS };
+module.exports = {
+  selectWhalePool, probe, falconQuery, enrichWallet,
+  normalizeTrader, passesFilters, score,
+  FILTERS, CONFIG, AGENTS,
+};
