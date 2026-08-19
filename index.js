@@ -406,6 +406,14 @@ async function refreshData() {
     return;
   }
 
+  // Falcon-selected whale pool, cached 24h (1 credit/day)
+  try {
+    const pool = await selectWhalePool();
+    if (pool && pool.length) cache.falconWhales = pool;
+  } catch (e) {
+    console.error("[whale-selection] failed, keeping existing whales:", e.message);
+  }
+  
   console.log("═══ REFRESHING ALL DATA ═══");
   const startTime = Date.now();
 
