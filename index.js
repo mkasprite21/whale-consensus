@@ -446,6 +446,22 @@ async function refreshData() {
 
 // ─── API Routes ──────────────────────────────────────────────────────
 
+// TEMPORARY — delete once we lock the field names
+app.get("/api/probe", async (req, res) => {
+  try {
+    const { falconQuery, AGENTS } = require("./whale-selection");
+    const agentId = AGENTS.leaderboard || AGENTS.walletPerf;
+    const { rows } = await falconQuery(
+      agentId,
+      AGENTS.leaderboard ? {} : { wallet_address: "0x6ac5bb06a9eb05641fd5e82640268b92f3ab4b6e" },
+      3, 0
+    );
+    res.json({ agentId, rowCount: rows.length, firstRow: rows[0] || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({
