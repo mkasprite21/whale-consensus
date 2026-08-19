@@ -43,7 +43,15 @@ const FILTERS = {
   min_pnl_15d: "5000",           // plays meaningful size
   min_total_trades_15d: "30",    // enough activity to be a sample
   max_total_trades_15d: "5000",  // not a bot you cannot mirror
-  sort_by: "roi",
+  // sort_by omitted on purpose -> Falcon defaults to H-Score, its own
+  // bot/luck-filtered quality ranking. Sorting by "roi" surfaces
+  // concentrated outliers (e.g. 1000% ROI across only 2 markets).
+};
+
+// Applied locally: Falcon has no server-side param for these.
+const LOCAL_RULES = {
+  minMarketsTraded15d: 5,   // spread across markets, not one lucky bet
+  maxHScoreRank: 250,       // stay near the top of their quality ranking
 };
 
 // ─── Local cache ───────────────────────────────────────────────────────
@@ -69,17 +77,22 @@ function normalizeWinRate(v) {
 // Falcon returns numbers as STRINGS, so everything goes through num().
 // Fields Falcon may not expose stay null and their logic is skipped.
 // >>> If a field name differs, fix it HERE and nowhere else. <<<
+// Confirmed against a live agent 584 response on 2026-08-18.
 function normalizeTrader(raw) {
   return {
-    address: raw.proxy_wallet ?? raw.wallet_address ?? raw.wallet ?? raw.address ?? null,
-    name: raw.username ?? raw.name ?? raw.proxy_wallet ?? "unknown",
-    winRate15d: normalizeWinRate(raw.win_rate_15d ?? raw.win_rate ?? raw.winRate),
-    roi15d: num(raw.roi_15d ?? raw.roi_pct ?? raw.roi),
-    pnl15d: num(raw.pnl_15d ?? raw.total_pnl ?? raw.pnl),
-    trades15d: num(raw.total_trades_15d ?? raw.total_trades ?? raw.trades),
-    falconScore: has(raw.falcon_score ?? raw.h_score ?? raw.score)
-      ? num(raw.falcon_score ?? raw.h_score ?? raw.score)
-      : null,
+    address: raw.wallet ?? raw.proxy_wallet ?? raw.wallet_address ?? null,
+    name: raw.username ?? raw.name ?? raw.wallet ?? "unknown",
+    winRate15d: normalizeWinRate(raw.win_rate_pct_15d),   // comes as "83.3"
+    roi15d: num(raw.roi_pct_15d),
+    pnl15d: num(raw.total_pnl_15d),
+    trades15d: num(raw.total_trades_15d),
+    marketsTraded15d: num(raw.markets_traded_15d),        // concentration guard
+    volume15d: num(raw.total_volume_15d),
+    hScore: has(raw.h_score) ? num(raw.h_score) : null,
+    rank: has(raw.leaderboard_rank) ? num(raw.leaderboard_rank) : null,
+    sharpe15d: has(raw.sharpe_ratio_15d) ? num(raw.sharpe_ratio_15d) : null,
+    tier: raw.tier ?? null,                               // e.g. "Emerging"
+    trajectory: raw.trajectory ?? null,                   // e.g. "improving"
     raw,
   };
 }
@@ -97,6 +110,10 @@ function passesFilters(t) {
   if (t.roi15d && t.roi15d < num(FILTERS.min_roi_15d)) reasons.push(`roi ${t.roi15d}%`);
   if (t.trades15d && t.trades15d < num(FILTERS.min_total_trades_15d)) reasons.push(`only ${t.trades15d} trades`);
   if (t.trades15d && t.trades15d > num(FILTERS.max_total_trades_15d)) reasons.push(`high-freq ${t.trades15d}`);
+  if (t.marketsTraded15d && t.marketsTraded15d < LOCAL_RULES.minMarketsTraded15d)
+    reasons.push(`only ${t.marketsTraded15d} markets`);
+  if (t.rank !== null && t.rank > LOCAL_RULES.maxHScoreRank)
+    reasons.push(`rank ${t.rank}`);
   return { ok: reasons.length === 0, reasons };
 }
 
@@ -105,16 +122,24 @@ function passesFilters(t) {
 // then ROI, then a mild bonus for the 60-85% win-rate sweet spot.
 function score(t) {
   let s = 0;
-  if (t.falconScore !== null) s += Math.min(t.falconScore / 100, 1) * 45;
-  else s += Math.min(Math.max(t.roi15d, 0) / 50, 1) * 45;
 
-  s += Math.min(Math.max(t.roi15d, 0) / 50, 1) * 30;
-  s += Math.min(Math.max(t.pnl15d, 0) / 100000, 1) * 15;
+  // H-Score leads: Falcon's own quality ranking, already luck/bot filtered.
+  if (t.hScore !== null) s += Math.min(t.hScore / 100, 1) * 40;
 
-  if (t.winRate15d !== null) {
-    const sweet = t.winRate15d >= 0.6 && t.winRate15d <= 0.85 ? 1 : 0.5;
-    s += sweet * 10;
-  }
+  // ROI capped at 100% so a 1000% outlier cannot buy its way to the top.
+  s += Math.min(Math.max(t.roi15d, 0) / 100, 1) * 20;
+
+  // Diversity: spread across markets beats one concentrated hit.
+  s += Math.min(t.marketsTraded15d / 20, 1) * 15;
+
+  s += Math.min(Math.max(t.pnl15d, 0) / 100000, 1) * 10;
+
+  // Win-rate sweet spot: confident favorites, not thin-edge farming.
+  if (t.winRate15d !== null) s += (t.winRate15d >= 0.6 && t.winRate15d <= 0.85 ? 1 : 0.4) * 10;
+
+  if (t.trajectory === "improving") s += 5;                       // momentum
+  if (t.sharpe15d !== null) s += Math.min(Math.max(t.sharpe15d, 0) / 3, 1) * 5;
+
   return s;
 }
 
@@ -180,7 +205,11 @@ async function selectWhalePool({ force = false } = {}) {
     roi15d: t.roi15d,
     pnl15d: t.pnl15d,
     trades15d: t.trades15d,
-    falconScore: t.falconScore,
+    hScore: t.hScore,
+    rank: t.rank,
+    marketsTraded15d: t.marketsTraded15d,
+    tier: t.tier,
+    trajectory: t.trajectory,
     score: +score(t).toFixed(1),
   }));
 
@@ -208,5 +237,5 @@ async function probe() {
 module.exports = {
   selectWhalePool, probe, falconQuery, enrichWallet,
   normalizeTrader, passesFilters, score,
-  FILTERS, CONFIG, AGENTS,
+  FILTERS, LOCAL_RULES, CONFIG, AGENTS,
 };
