@@ -15,7 +15,7 @@
 
 const express = require("express");
 const cors = require("cors");
-
+const { selectWhalePool } = require("./whale-selection");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
